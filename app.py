@@ -1,187 +1,137 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
+import networkx as nx
+from pyvis.network import Network
+import streamlit.components.v1 as components
+import json
 
-# --- Configuración de la Página ---
-st.set_page_config(
-    page_title="Dashboard de Enlazado Interno",
-    page_icon="🔗",
-    layout="wide"
-)
+# --- 1. CONFIGURACIÓN DE LA PÁGINA ---
+st.set_page_config(page_title="Visualizador de Enlazado Interno", page_icon="🔗", layout="wide")
 
-# --- Título y Cabecera ---
-st.title("🔗 Dashboard de Análisis de Enlazado Interno")
+# --- 2. TÍTULO Y DESCRIPCIÓN ---
+st.title('🔗 Visualizador de Enlazado Interno (Interactivo)')
 st.markdown("""
-Sube el archivo `master_file_final.csv` generado previamente para visualizar la estructura de enlaces internos de tu sitio.
-Esta herramienta te ayudará a identificar qué páginas reciben y envían más enlaces, y cuáles son los textos ancla más utilizados.
+Sube tu archivo CSV. **En el mapa de red:**
+1.  **Haz clic en un círculo** para aislarlo y ver solo las páginas a las que enlaza.
+2.  **Vuelve a hacer clic** en el mismo círculo para regresar a la vista general.
 """)
 
-# --- Barra Lateral (Sidebar) ---
-st.sidebar.header("Configuración")
+# --- 3. FUNCIÓN DE PROCESAMIENTO (Sin cambios) ---
+def process_data(uploaded_file):
+    df = pd.read_csv(uploaded_file, header=0)
+    links_list = []
+    source_col_name = df.columns[0]
+    for _, row in df.iterrows():
+        source_url = row[source_col_name]
+        for i in range(1, len(df.columns), 2):
+            if i + 1 < len(df.columns):
+                target_url = row.iloc[i]
+                anchor_text = row.iloc[i+1]
+                if pd.notna(target_url) and str(target_url).strip() != '':
+                    links_list.append({
+                        'Source': str(source_url).strip(),
+                        'Target': str(target_url).strip(),
+                        'Anchor_Text': str(anchor_text).strip()
+                    })
+    return pd.DataFrame(links_list)
 
-# Widget para subir el archivo
-uploaded_file = st.sidebar.file_uploader(
-    "Carga tu archivo master_file_final.csv",
-    type=["csv"]
-)
+# --- 4. NUEVA FUNCIÓN PARA GENERAR EL MAPA DE RED INTERACTIVO ---
+def generate_interactive_network(df_links):
+    # Crear el grafo a partir de los datos
+    G = nx.from_pandas_edgelist(df_links, 'Source', 'Target', create_using=nx.DiGraph())
+    
+    # Crear la red con Pyvis
+    net = Network(height='800px', width='100%', bgcolor='#222222', font_color='white', notebook=True, directed=True)
+    net.from_nx(G)
 
-# --- Lógica Principal de la Aplicación ---
-if uploaded_file is None:
-    st.info("👈 Por favor, carga un archivo CSV para comenzar el análisis.")
-    st.stop()
+    # Personalizar tamaño y título de los nodos
+    in_degree = dict(G.in_degree)
+    for node in net.nodes:
+        degree = in_degree.get(node['id'], 0)
+        node['value'] = 10 + degree * 3
+        node['title'] = f"{node['id']}<br>Enlaces entrantes: {degree}"
 
-# --- Carga y Cache de Datos ---
-# Usamos un decorador de cache para que los datos no se recarguen en cada interacción.
-@st.cache_data
-def load_data(file):
+    # Ocultar las aristas (enlaces) en la carga inicial
+    for edge in net.edges:
+        edge['hidden'] = True
+
+    # Generar el HTML base
+    html_content = net.generate_html()
+
+    # Preparar los datos para el script de JavaScript
+    # Creamos un "mapa" de qué nodos enlaza cada nodo
+    adjacency_list = json.dumps({source: list(G.successors(source)) for source in G.nodes()})
+
+    # Inyectar el script de JavaScript para la interactividad
+    js_script = f"""
+    <script type="text/javascript">
+        // Espera a que la red esté lista
+        document.addEventListener('DOMContentLoaded', function() {{
+            // Mapa de adyacencia (quién enlaza a quién)
+            const adjacencyList = {adjacency_list};
+            let allNodes = network.body.data.nodes.get({{ return: 'Array' }});
+            let allEdges = network.body.data.edges.get({{ return: 'Array' }});
+            let selectedNode = null;
+
+            network.on('click', function(params) {{
+                const nodeId = params.nodes[0];
+
+                if (nodeId && nodeId === selectedNode) {{
+                    // --- SEGUNDO CLIC: Volver a la vista general ---
+                    // Muestra todos los nodos y oculta todas las aristas
+                    let updates = allNodes.map(n => ({{ id: n.id, hidden: false }}));
+                    network.body.data.nodes.update(updates);
+                    let edgeUpdates = allEdges.map(e => ({{ id: e.id, hidden: true }}));
+                    network.body.data.edges.update(edgeUpdates);
+                    selectedNode = null;
+                }} else if (nodeId) {{
+                    // --- PRIMER CLIC: Aislar el nodo ---
+                    selectedNode = nodeId;
+                    const neighbors = adjacencyList[nodeId] || [];
+                    
+                    // Oculta todos los nodos
+                    let nodeUpdates = allNodes.map(n => ({{ id: n.id, hidden: true }}));
+                    network.body.data.nodes.update(nodeUpdates);
+                    
+                    // Muestra solo el nodo seleccionado y sus vecinos
+                    let nodesToShow = [nodeId, ...neighbors];
+                    let showUpdates = nodesToShow.map(n_id => ({{ id: n_id, hidden: false }}));
+                    network.body.data.nodes.update(showUpdates);
+
+                    // Muestra solo las aristas que salen del nodo seleccionado
+                    let edgeUpdates = allEdges.map(e => ({{ 
+                        id: e.id, 
+                        hidden: !(e.from === nodeId && nodesToShow.includes(e.to)) 
+                    }}));
+                    network.body.data.edges.update(edgeUpdates);
+                }}
+            }});
+        }});
+    </script>
+    """
+    
+    # Insertar el script justo antes de cerrar el body del HTML
+    final_html = html_content.replace('</body>', f'{js_script}</body>')
+    return final_html
+
+# --- 5. CARGADOR DE ARCHIVOS Y LÓGICA PRINCIPAL ---
+uploaded_file = st.file_uploader("📂 Sube tu archivo CSV aquí", type="csv")
+
+if uploaded_file is not None:
     try:
-        df = pd.read_csv(file)
-        # Limpieza básica de datos
-        df['URL Destino'] = df['URL Destino'].str.strip()
-        df['Anchor text'] = df['Anchor text'].str.strip()
-        return df
+        df_links = process_data(uploaded_file)
+
+        if df_links.empty:
+            st.warning("No se encontraron enlaces válidos en el archivo.")
+        else:
+            st.success(f"¡Archivo procesado con éxito! Se encontraron **{len(df_links)}** enlaces internos.")
+            
+            # --- PESTAÑA DEL MAPA DE RED ---
+            st.header('🗺️ Mapa de Red Interactivo')
+            
+            # Genera y muestra el mapa interactivo
+            interactive_html = generate_interactive_network(df_links)
+            components.html(interactive_html, height=850, scrolling=True)
+
     except Exception as e:
-        st.error(f"Error al leer el archivo: {e}")
-        return None
-
-df = load_data(uploaded_file)
-
-if df is None:
-    st.stop()
-
-# --- Métricas Principales ---
-st.header("Métricas Generales")
-
-total_paginas_origen = df['Dirección'].nunique()
-total_enlaces = len(df)
-total_paginas_destino = df['URL Destino'].nunique()
-
-col1, col2, col3 = st.columns(3)
-col1.metric("Páginas de Origen Únicas", f"{total_paginas_origen}")
-col2.metric("Total de Enlaces Analizados", f"{total_enlaces}")
-col3.metric("Páginas de Destino Únicas", f"{total_paginas_destino}")
-
-st.markdown("---")
-
-# --- Visualizaciones de Datos ---
-st.header("Análisis Gráfico del Enlazado")
-
-# Dividir la sección en dos columnas para los gráficos
-col_graf1, col_graf2 = st.columns(2)
-
-# Gráfico 1: Top 20 Páginas con MÁS ENLACES SALIENTES (desde el contenido)
-with col_graf1:
-    st.subheader("Top 15 Páginas con Más Enlaces Salientes")
-    origen_counts = df['Dirección'].value_counts().nlargest(15).sort_values(ascending=True)
-    fig_origen = px.bar(
-        origen_counts,
-        x=origen_counts.values,
-        y=origen_counts.index,
-        orientation='h',
-        title="Páginas que más enlazan a otras",
-        labels={'x': 'Cantidad de Enlaces Salientes', 'y': 'URL de Origen'},
-        template="plotly_white"
-    )
-    fig_origen.update_layout(showlegend=False)
-    st.plotly_chart(fig_origen, use_container_width=True)
-
-# Gráfico 2: Top 20 Páginas que MÁS ENLACES RECIBEN
-with col_graf2:
-    st.subheader("Top 15 Páginas que Reciben Más Enlaces")
-    destino_counts = df['URL Destino'].value_counts().nlargest(15).sort_values(ascending=True)
-    fig_destino = px.bar(
-        destino_counts,
-        x=destino_counts.values,
-        y=destino_counts.index,
-        orientation='h',
-        title="Páginas más enlazadas internamente",
-        labels={'x': 'Cantidad de Enlaces Entrantes', 'y': 'URL de Destino'},
-        color_discrete_sequence=['#ff7f0e']
-    )
-    fig_destino.update_layout(showlegend=False)
-    st.plotly_chart(fig_destino, use_container_width=True)
-
-# Gráfico 3: Top 20 Anchor Texts más utilizados
-st.subheader("Top 20 Textos Ancla Más Utilizados")
-anchor_counts = df['Anchor text'].value_counts().nlargest(20)
-fig_anchor = px.bar(
-    anchor_counts,
-    x=anchor_counts.index,
-    y=anchor_counts.values,
-    title="Frecuencia de los Textos Ancla",
-    labels={'x': 'Texto Ancla', 'y': 'Frecuencia'},
-    color_discrete_sequence=px.colors.qualitative.Pastel
-)
-st.plotly_chart(fig_anchor, use_container_width=True)
-
-st.markdown("---")
-
-# --- Explorador de Enlaces por Página (Diagrama de Sankey) ---
-st.header("Explorador de Flujo de Enlaces por Página")
-st.markdown("Selecciona una página de origen para ver a dónde enlaza y con qué textos ancla.")
-
-# Selector para la página de origen
-lista_paginas = sorted(df['Dirección'].unique())
-pagina_seleccionada = st.selectbox(
-    "Selecciona una página de Origen:",
-    options=lista_paginas
-)
-
-if pagina_seleccionada:
-    # Filtrar el dataframe por la página seleccionada
-    df_filtrado = df[df['Dirección'] == pagina_seleccionada]
-
-    if not df_filtrado.empty:
-        # Crear nodos para el diagrama de Sankey
-        # Los nodos son: la página de origen, los textos ancla y las páginas de destino
-        all_nodes = list(pd.concat([
-            df_filtrado['Dirección'],
-            df_filtrado['Anchor text'],
-            df_filtrado['URL Destino']
-        ]).unique())
-        
-        # Crear un diccionario para mapear nodos a índices numéricos
-        node_map = {node: i for i, node in enumerate(all_nodes)}
-
-        # Crear las fuentes (sources), destinos (targets) y valores (values) para el Sankey
-        sources = df_filtrado['Dirección'].map(node_map)
-        targets_anchor = df_filtrado['Anchor text'].map(node_map)
-        
-        sources_anchor = df_filtrado['Anchor text'].map(node_map)
-        targets_final = df_filtrado['URL Destino'].map(node_map)
-
-        # Combinar los flujos: (Página -> Anchor) y (Anchor -> URL Destino)
-        link_sources = pd.concat([sources, sources_anchor])
-        link_targets = pd.concat([targets_anchor, targets_final])
-        values = [1] * len(link_sources) # Cada enlace cuenta como 1
-
-        # Crear la figura del diagrama de Sankey
-        fig_sankey = go.Figure(data=[go.Sankey(
-            node=dict(
-                pad=15,
-                thickness=20,
-                line=dict(color="black", width=0.5),
-                label=all_nodes,
-                color="blue"
-            ),
-            link=dict(
-                source=link_sources,
-                target=link_targets,
-                value=values
-            ))])
-
-        fig_sankey.update_layout(
-            title_text=f"Flujo de enlaces desde: {pagina_seleccionada}",
-            font_size=10
-        )
-        st.plotly_chart(fig_sankey, use_container_width=True)
-    else:
-        st.warning("No se encontraron datos de enlaces para la página seleccionada.")
-
-st.markdown("---")
-
-# --- Tabla de Datos Crudos ---
-st.header("Explorar Datos Crudos")
-st.markdown("Usa los filtros de las columnas para buscar datos específicos.")
-st.dataframe(df)
+        st.error(f"❌ Ocurrió un error al procesar el archivo: {e}")
