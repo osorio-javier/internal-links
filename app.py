@@ -10,32 +10,41 @@ st.set_page_config(page_title="Visualizador de Enlazado Interno", page_icon="�
 
 # --- 2. TÍTULO Y DESCRIPCIÓN ---
 st.title('🔗 Visualizador de Enlazado Interno (Interactivo)')
-st.markdown("""
-Sube tu archivo CSV. **En el mapa de red:**
-1.  **Haz clic en un círculo** para aislarlo y ver solo las páginas a las que enlaza.
-2.  **Vuelve a hacer clic** en el mismo círculo para regresar a la vista general.
-""")
+st.markdown("Sube tu archivo CSV para analizar la estructura de enlaces.")
 
-# --- 3. FUNCIÓN DE PROCESAMIENTO DE DATOS ---
+# --- 3. FUNCIÓN DE PROCESAMIENTO (CORREGIDA PARA EL FORMATO REAL DEL CSV)---
 def process_data(uploaded_file):
-    df = pd.read_csv(uploaded_file, header=0)
-    links_list = []
-    source_col_name = df.columns[0]
-    for _, row in df.iterrows():
-        source_url = row[source_col_name]
-        for i in range(1, len(df.columns), 2):
-            if i + 1 < len(df.columns):
-                target_url = row.iloc[i]
-                anchor_text = row.iloc[i+1]
-                if pd.notna(target_url) and str(target_url).strip() != '':
-                    links_list.append({
-                        'Source': str(source_url).strip(),
-                        'Target': str(target_url).strip(),
-                        'Anchor_Text': str(anchor_text).strip()
-                    })
-    return pd.DataFrame(links_list)
+    """
+    Procesa el CSV con formato de bloques (todas las URLs primero, luego todos los anclas).
+    """
+    df = pd.read_csv(uploaded_file)
+    
+    # Identifica las columnas de URL y de Texto Ancla por separado
+    url_cols = [col for col in df.columns if 'URL_Destino_Contenido' in col]
+    texto_cols = [col for col in df.columns if 'Texto_Ancla_Contenido' in col]
 
-# --- 4. FUNCIÓN PARA GENERAR EL MAPA DE RED (CORREGIDA) ---
+    # Transforma ambos bloques de datos a un formato largo
+    melted_urls = df.melt(id_vars='Dirección', value_vars=url_cols, value_name='Target')
+    melted_textos = df.melt(id_vars='Dirección', value_vars=texto_cols, value_name='Anchor_Text')
+
+    # Extrae el número de cada columna para poder unirlas correctamente
+    melted_urls['link_num'] = melted_urls['variable'].str.extract(r'(\d+)').astype(int)
+    melted_textos['link_num'] = melted_textos['variable'].str.extract(r'(\d+)').astype(int)
+
+    # Une las URLs con sus textos ancla correspondientes
+    df_long = pd.merge(melted_urls, melted_textos, on=['Dirección', 'link_num'])
+
+    # Limpieza final
+    df_links = df_long[['Dirección', 'Target', 'Anchor_Text']].copy()
+    df_links.dropna(subset=['Target'], inplace=True)
+    df_links.rename(columns={'Dirección': 'Source'}, inplace=True)
+    
+    df_links['Source'] = df_links['Source'].astype(str).str.strip()
+    df_links['Target'] = df_links['Target'].astype(str).str.strip()
+
+    return df_links
+
+# --- 4. FUNCIÓN PARA GENERAR EL MAPA DE RED ---
 def generate_interactive_network(df_links):
     G = nx.from_pandas_edgelist(df_links, 'Source', 'Target', create_using=nx.DiGraph())
     net = Network(height='800px', width='100%', bgcolor='#222222', font_color='white', notebook=True, directed=True)
@@ -50,10 +59,7 @@ def generate_interactive_network(df_links):
     for edge in net.edges:
         edge['hidden'] = True
 
-    # ---- CAMBIO CLAVE: Generamos el HTML directamente en una variable ----
-    # Ya no se intenta guardar y leer un archivo físico.
     html_content = net.generate_html()
-    
     adjacency_list = json.dumps({source: list(G.successors(source)) for source in G.nodes()})
 
     js_script = f"""
